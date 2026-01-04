@@ -6,8 +6,13 @@
 
 set -e
 
-# Configuration
-BUILD_DIR="${BUILD_DIR:-/tmp/mixos-build}"
+# Standardized directory structure
+# BUILD_DIR: temporary build files
+# BUILD_DIR/rootfs: the rootfs being built (contains lib/modules)
+# OUTPUT_DIR: final artifacts
+# OUTPUT_DIR/boot: kernel and initramfs output
+# OUTPUT_DIR/modules-mixos.tar.gz: kernel modules archive
+BUILD_DIR="${BUILD_DIR:-$(pwd)/.tmp/mixos-build}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/artifacts}"
 REPO_ROOT="${REPO_ROOT:-$(pwd)}"
 INITRAMFS_SRC="$REPO_ROOT/initramfs"
@@ -128,6 +133,10 @@ CONFIG_ASH_BASH_COMPAT=y
 CONFIG_FEATURE_SH_STANDALONE=n
 EOF
 
+# Normalize config for any new options with defaults
+log_info "Normalizing BusyBox configuration..."
+yes "" | make oldconfig > /dev/null 2>&1 || true
+
 # Build
 log_info "Building BusyBox..."
 make -j"$(nproc)" 2>/dev/null || make
@@ -166,8 +175,14 @@ fi
 # ============================================================================
 log_info "Installing kernel modules..."
 
+# Modules can be in multiple locations:
+# 1. BUILD_DIR/rootfs/lib/modules/$KERNEL_VERSION (if rootfs was built with modules)
+# 2. OUTPUT_DIR/modules-mixos.tar.gz (kernel modules archive)
+# We'll try both approaches
+
 MODULES_SRC="$BUILD_DIR/rootfs/lib/modules/$KERNEL_VERSION"
 MODULES_DST="$INITRAMFS_BUILD/lib/modules/$KERNEL_VERSION"
+MODULES_TARBALL="$OUTPUT_DIR/modules-mixos.tar.gz"
 
 # Essential modules for boot
 ESSENTIAL_MODULES="
@@ -192,6 +207,22 @@ ESSENTIAL_MODULES="
     kernel/crypto/crc32c_generic.ko
 "
 
+# If modules tarball exists but rootfs modules don't, extract to a temp location
+MODULES_FOUND=0
+if [ ! -d "$MODULES_SRC" ] && [ -f "$MODULES_TARBALL" ]; then
+    log_info "Extracting modules from $MODULES_TARBALL..."
+    TEMP_MODULES="$BUILD_DIR/temp-modules"
+    rm -rf "$TEMP_MODULES"
+    mkdir -p "$TEMP_MODULES"
+    tar -xzf "$MODULES_TARBALL" -C "$TEMP_MODULES"
+    # Find the actual modules directory (it's under lib/modules/VERSION)
+    EXTRACTED_MODULES=$(find "$TEMP_MODULES" -type d -name "6.6.*" | head -1)
+    if [ -n "$EXTRACTED_MODULES" ] && [ -d "$EXTRACTED_MODULES" ]; then
+        MODULES_SRC="$EXTRACTED_MODULES"
+        log_ok "Modules extracted to $MODULES_SRC"
+    fi
+fi
+
 if [ -d "$MODULES_SRC" ]; then
     mkdir -p "$MODULES_DST/kernel"
     
@@ -201,6 +232,7 @@ if [ -d "$MODULES_SRC" ]; then
             mkdir -p "$MODULES_DST/$mod_dir"
             cp "$MODULES_SRC/$mod" "$MODULES_DST/$mod"
             log_info "  Copied: $mod"
+            MODULES_FOUND=1
         fi
     done
     
@@ -214,9 +246,14 @@ if [ -d "$MODULES_SRC" ]; then
         depmod -a -b "$INITRAMFS_BUILD" "$KERNEL_VERSION" 2>/dev/null || true
     fi
     
-    log_ok "Kernel modules installed"
+    if [ "$MODULES_FOUND" -eq 1 ]; then
+        log_ok "Kernel modules installed"
+    else
+        log_warn "No essential modules found in $MODULES_SRC"
+    fi
 else
     log_warn "Kernel modules not found at $MODULES_SRC"
+    log_warn "Also checked for $MODULES_TARBALL"
     log_warn "Initramfs will rely on built-in kernel modules"
 fi
 

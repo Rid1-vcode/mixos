@@ -2,13 +2,13 @@
 # Version 1.0.0 - VISO/SDISK/VRAM Support
 
 SHELL := /bin/bash
-.PHONY: all clean toolchain kernel mix-cli installer packages rootfs iso test help
-.PHONY: all clean toolchain kernel mix-cli packages rootfs iso test help
-.PHONY: initramfs viso sdisk vram modules-dep test-vram test-viso
+.PHONY: all clean toolchain kernel mix-cli installer packages rootfs initramfs iso test help
+.PHONY: viso sdisk vram modules-dep test test-mix test-qemu test-iso test-viso test-vram test-sdisk
+.PHONY: toolchain-check kernel-config mix-cli-static iso-autoinstall info dev-shell clean-all checksums
 
 # Configuration
 VERSION := 1.0.0
-BUILD_DIR := /tmp/mixos-build
+BUILD_DIR := $(CURDIR)/.tmp/mixos-build
 OUTPUT_DIR := $(CURDIR)/artifacts
 KERNEL_VERSION := 6.6.8-mixos
 JOBS := $(shell nproc)
@@ -19,7 +19,8 @@ VISO_SIZE := 2G
 VRAM_MIN_RAM := 2048
 
 # Export for sub-scripts
-export BUILD_DIR OUTPUT_DIR JOBS KERNEL_VERSION VERSION VISO_NAME VISO_SIZE
+REPO_ROOT := $(CURDIR)
+export BUILD_DIR OUTPUT_DIR JOBS KERNEL_VERSION VERSION VISO_NAME VISO_SIZE REPO_ROOT
 
 # Colors for output
 GREEN := \033[0;32m
@@ -33,8 +34,8 @@ NC := \033[0m
 # Main targets
 #=============================================================================
 
-all: toolchain-check kernel mix-cli installer packages rootfs iso
-all: toolchain-check kernel mix-cli packages rootfs initramfs viso
+# all: toolchain-check kernel mix-cli installer packages rootfs iso
+all: toolchain-check kernel mix-cli installer packages rootfs initramfs viso iso
 	@echo -e "$(GREEN)✓ MixOS-GO v$(VERSION) build complete!$(NC)"
 	@echo ""
 	@echo "Build artifacts:"
@@ -75,7 +76,8 @@ help:
 	@echo "  test-vram    - Boot with VRAM mode enabled"
 	@echo ""
 	@echo "Utility targets:"
-	@echo "  toolchain    - Build Docker toolchain image"
+	@echo "  toolchain    - Build Docker build environment (mixos-go-build:latest)"
+	@echo "  dev-shell    - Launch interactive development shell in Docker"
 	@echo "  toolchain-check - Verify build tools are available"
 	@echo "  info         - Show build configuration"
 	@echo ""
@@ -85,9 +87,11 @@ help:
 #=============================================================================
 
 toolchain:
-	@echo -e "$(YELLOW)Building Docker toolchain...$(NC)"
-	docker build -t mixos-toolchain -f build/docker/Dockerfile.toolchain build/docker/
-	@echo -e "$(GREEN)✓ Toolchain ready$(NC)"
+	@echo -e "$(YELLOW)Building Docker build environment...$(NC)"
+	docker build -t mixos-go-build:latest -f build/docker/Dockerfile.toolchain .
+	@echo -e "$(GREEN)✓ Build environment ready$(NC)"
+	@echo "Use 'make dev-shell' to enter the environment or:"
+	@echo "  docker run --rm -it --privileged -v \$$(pwd):/workspace -w /workspace mixos-go-build:latest bash -c 'make all'"
 
 toolchain-check:
 	@echo -e "$(YELLOW)Checking build tools...$(NC)"
@@ -153,13 +157,14 @@ installer: toolchain-check
 	cd src/installer && \
 		go mod tidy && \
 		GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o $(OUTPUT_DIR)/mixos-install .
-	@echo -e "$(GREEN)✓ Installer built ($(shell du -h $(OUTPUT_DIR)/mixos-install | cut -f1 2>/dev/null || echo '0'))$(NC)"
+	@echo -e "$(GREEN)✓ Installer built ($(shell [ -f $(OUTPUT_DIR)/mixos-install ] && du -h $(OUTPUT_DIR)/mixos-install | cut -f1 || echo 'unknown'))$(NC)"
 
 #=============================================================================
 # Root Filesystem
 #=============================================================================
 
-rootfs: mix-cli packages
+# rootfs depends on kernel (for modules), installer, mix-cli, and packages
+rootfs: kernel installer mix-cli packages
 	@echo -e "$(YELLOW)Building root filesystem...$(NC)"
 	@bash build/scripts/build-rootfs.sh
 	@echo -e "$(GREEN)✓ Rootfs created$(NC)"
@@ -188,7 +193,8 @@ iso-autoinstall: toolchain-check
 # VISO/SDISK/VRAM (Revolutionary Features)
 #=============================================================================
 
-initramfs: toolchain-check
+# initramfs depends on kernel (for modules) - rootfs is optional but recommended
+initramfs: kernel
 	@echo -e "$(CYAN)Building enhanced initramfs with VISO/VRAM support...$(NC)"
 	@mkdir -p $(OUTPUT_DIR)/boot
 	@bash build/scripts/build-initramfs.sh
@@ -235,57 +241,98 @@ test-mix:
 	@echo -e "$(GREEN)✓ Mix CLI tests passed$(NC)"
 
 test-qemu:
-	@echo -e "$(YELLOW)Booting ISO in QEMU...$(NC)"
+	@echo -e "$(YELLOW)Booting ISO in QEMU (With kernel and SDISK)...$(NC)"
+	@KERNEL=""; \
+	if [ -f $(OUTPUT_DIR)/boot/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/boot/vmlinuz-mixos; \
+	elif [ -f $(OUTPUT_DIR)/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/vmlinuz-mixos; fi; \
+	if [ -n "$$KERNEL" ] && [ -f $(OUTPUT_DIR)/boot/initramfs-mixos.img ] && [ -f $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso ]; then \
+		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
+			-cdrom $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso \
+			-m 512 \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
+			-enable-kvm 2>/dev/null || \
+		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
+			-cdrom $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso \
+			-m 512 \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
+			-nographic; \
+	else \
+		echo -e "$(RED)Required artifacts not found. Run 'make iso' first.$(NC)"; \
+		exit 1; \
+	fi
+
+test-iso:
+	@echo -e "$(CYAN)Testing ISO boot (Alternative method without external kernel)...$(NC)"
 	@if [ -f $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso ]; then \
 		qemu-system-x86_64 \
 			-cdrom $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso \
 			-m 512 \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
 			-enable-kvm 2>/dev/null || \
 		qemu-system-x86_64 \
 			-cdrom $(OUTPUT_DIR)/mixos-go-v$(VERSION).iso \
 			-m 512 \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
 			-nographic; \
 	else \
 		echo -e "$(RED)ISO not found. Run 'make iso' first.$(NC)"; \
 		exit 1; \
 	fi
 
-test-iso: test-qemu
-
 test-viso:
-	@echo -e "$(CYAN)Booting VISO in QEMU with virtio (Maximum Performance)...$(NC)"
-	@if [ -f $(OUTPUT_DIR)/$(VISO_NAME).viso ]; then \
+	@echo -e "$(CYAN)Booting VISO with kernel and SDISK (Maximum Performance)...$(NC)"
+	@KERNEL=""; \
+	if [ -f $(OUTPUT_DIR)/boot/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/boot/vmlinuz-mixos; \
+	elif [ -f $(OUTPUT_DIR)/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/vmlinuz-mixos; fi; \
+	if [ -f $(OUTPUT_DIR)/$(VISO_NAME).viso ] && [ -n "$$KERNEL" ] && [ -f $(OUTPUT_DIR)/boot/initramfs-mixos.img ]; then \
 		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
 			-drive file=$(OUTPUT_DIR)/$(VISO_NAME).viso,format=qcow2,if=virtio,cache=writeback,aio=threads \
 			-m 2G \
 			-cpu host \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
 			-enable-kvm 2>/dev/null || \
 		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
 			-drive file=$(OUTPUT_DIR)/$(VISO_NAME).viso,format=qcow2,if=virtio \
 			-m 2G \
+			-append "console=ttyS0 SDISK=$(VISO_NAME).VISO" \
 			-nographic; \
 	else \
-		echo -e "$(RED)VISO not found. Run 'make viso' first.$(NC)"; \
+		echo -e "$(RED)Required artifacts not found. Run 'make viso' first.$(NC)"; \
 		exit 1; \
 	fi
 
 test-vram:
 	@echo -e "$(CYAN)Booting with VRAM mode (System runs from RAM)...$(NC)"
-	@if [ -f $(OUTPUT_DIR)/$(VISO_NAME).viso ]; then \
+	@KERNEL=""; \
+	if [ -f $(OUTPUT_DIR)/boot/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/boot/vmlinuz-mixos; \
+	elif [ -f $(OUTPUT_DIR)/vmlinuz-mixos ]; then KERNEL=$(OUTPUT_DIR)/vmlinuz-mixos; fi; \
+	if [ -f $(OUTPUT_DIR)/$(VISO_NAME).viso ] && [ -n "$$KERNEL" ] && [ -f $(OUTPUT_DIR)/boot/initramfs-mixos.img ]; then \
 		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
 			-drive file=$(OUTPUT_DIR)/$(VISO_NAME).viso,format=qcow2,if=virtio,cache=writeback,aio=threads \
 			-m 4G \
 			-cpu host \
-			-enable-kvm \
 			-append "console=ttyS0 VRAM=auto SDISK=$(VISO_NAME).VISO" \
+			-enable-kvm \
 			-nographic 2>/dev/null || \
 		qemu-system-x86_64 \
+			-kernel $$KERNEL \
+			-initrd $(OUTPUT_DIR)/boot/initramfs-mixos.img \
 			-drive file=$(OUTPUT_DIR)/$(VISO_NAME).viso,format=qcow2,if=virtio \
 			-m 4G \
-			-append "console=ttyS0 VRAM=auto" \
+			-append "console=ttyS0 VRAM=auto SDISK=$(VISO_NAME).VISO" \
 			-nographic; \
 	else \
-		echo -e "$(RED)VISO not found. Run 'make viso' first.$(NC)"; \
+		echo -e "$(RED)Required artifacts not found. Run 'make viso' first.$(NC)"; \
 		exit 1; \
 	fi
 
@@ -307,17 +354,19 @@ clean:
 
 clean-all: clean
 	rm -rf $(BUILD_DIR)
-	docker rmi mixos-toolchain 2>/dev/null || true
+	docker rmi mixos-go-build:latest 2>/dev/null || true
 
 #=============================================================================
 # Development helpers
 #=============================================================================
 
-dev-shell:
-	@docker run -it --rm \
+dev-shell: toolchain
+	@echo -e "$(YELLOW)Launching development shell in Docker...$(NC)"
+	docker run -it --rm \
 		-v $(CURDIR):/workspace \
 		-w /workspace \
-		mixos-toolchain \
+		--privileged \
+		mixos-go-build:latest \
 		/bin/bash
 
 checksums:

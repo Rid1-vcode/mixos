@@ -12,8 +12,12 @@
 
 set -e
 
-# Configuration
-BUILD_DIR="${BUILD_DIR:-/tmp/mixos-build}"
+# Standardized directory structure
+# BUILD_DIR: temporary build files
+# BUILD_DIR/rootfs: the rootfs being built
+# OUTPUT_DIR: final artifacts
+# OUTPUT_DIR/boot: kernel and initramfs
+BUILD_DIR="${BUILD_DIR:-$(pwd)/.tmp/mixos-build}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/artifacts}"
 REPO_ROOT="${REPO_ROOT:-$(pwd)}"
 VERSION="${VERSION:-1.0.0}"
@@ -59,8 +63,20 @@ mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 log_step "Verifying prerequisites..."
 
 ROOTFS_DIR="$BUILD_DIR/rootfs"
-KERNEL_PATH="$OUTPUT_DIR/boot/vmlinuz-mixos"
-INITRAMFS_PATH="$OUTPUT_DIR/boot/initramfs-mixos.img"
+
+# Check for kernel - look in both boot/ and root of OUTPUT_DIR
+KERNEL_PATH=""
+if [ -f "$OUTPUT_DIR/boot/vmlinuz-mixos" ]; then
+    KERNEL_PATH="$OUTPUT_DIR/boot/vmlinuz-mixos"
+elif [ -f "$OUTPUT_DIR/vmlinuz-mixos" ]; then
+    KERNEL_PATH="$OUTPUT_DIR/vmlinuz-mixos"
+fi
+
+# Check for initramfs
+INITRAMFS_PATH=""
+if [ -f "$OUTPUT_DIR/boot/initramfs-mixos.img" ]; then
+    INITRAMFS_PATH="$OUTPUT_DIR/boot/initramfs-mixos.img"
+fi
 
 # Check for rootfs
 if [ ! -d "$ROOTFS_DIR" ]; then
@@ -70,15 +86,19 @@ if [ ! -d "$ROOTFS_DIR" ]; then
 fi
 
 # Check for kernel (optional - can use host kernel for testing)
-if [ ! -f "$KERNEL_PATH" ]; then
-    log_warn "Kernel not found at $KERNEL_PATH"
+if [ -z "$KERNEL_PATH" ]; then
+    log_warn "Kernel not found at $OUTPUT_DIR/boot/vmlinuz-mixos or $OUTPUT_DIR/vmlinuz-mixos"
     log_info "Will create VISO without kernel (use host kernel for testing)"
+else
+    log_ok "Found kernel at $KERNEL_PATH"
 fi
 
 # Check for initramfs
-if [ ! -f "$INITRAMFS_PATH" ]; then
-    log_warn "Initramfs not found at $INITRAMFS_PATH"
+if [ -z "$INITRAMFS_PATH" ]; then
+    log_warn "Initramfs not found at $OUTPUT_DIR/boot/initramfs-mixos.img"
     log_info "Run 'make initramfs' first for full VISO support"
+else
+    log_ok "Found initramfs at $INITRAMFS_PATH"
 fi
 
 # Check for required tools
@@ -92,7 +112,29 @@ done
 log_ok "Prerequisites verified"
 
 # ============================================================================
-# Step 2: Create squashfs rootfs
+# Step 2: Ensure install.yaml is in rootfs for unattended install
+# ============================================================================
+log_step "Checking for install.yaml..."
+PACKAGING_INSTALL_YAML="$REPO_ROOT/packaging/install.yaml"
+if [ ! -f "$ROOTFS_DIR/etc/mixos/install.yaml" ]; then
+    mkdir -p "$ROOTFS_DIR/etc/mixos"
+    if [ -n "$INSTALL_CONFIG" ] && [ -f "$INSTALL_CONFIG" ]; then
+        log_info "Copying provided installer config: $INSTALL_CONFIG"
+        cp "$INSTALL_CONFIG" "$ROOTFS_DIR/etc/mixos/install.yaml"
+        chmod 0644 "$ROOTFS_DIR/etc/mixos/install.yaml"
+    elif [ -f "$PACKAGING_INSTALL_YAML" ]; then
+        log_info "Copying $PACKAGING_INSTALL_YAML"
+        cp "$PACKAGING_INSTALL_YAML" "$ROOTFS_DIR/etc/mixos/install.yaml"
+        chmod 0644 "$ROOTFS_DIR/etc/mixos/install.yaml"
+    else
+        log_warn "No install.yaml found - unattended install will not be available"
+    fi
+else
+    log_ok "install.yaml already present in rootfs"
+fi
+
+# ============================================================================
+# Step 3: Create squashfs rootfs
 # ============================================================================
 log_step "Creating squashfs rootfs..."
 
@@ -117,7 +159,7 @@ else
 fi
 
 # ============================================================================
-# Step 3: Create VISO directory structure
+# Step 4: Create VISO directory structure
 # ============================================================================
 log_step "Creating VISO structure..."
 
@@ -126,12 +168,14 @@ rm -rf "$VISO_BUILD"
 mkdir -p "$VISO_BUILD"/{boot,rootfs,config,tools}
 
 # Copy boot files
-if [ -f "$KERNEL_PATH" ]; then
+if [ -n "$KERNEL_PATH" ] && [ -f "$KERNEL_PATH" ]; then
     cp "$KERNEL_PATH" "$VISO_BUILD/boot/"
+    log_ok "Kernel copied to VISO"
 fi
 
-if [ -f "$INITRAMFS_PATH" ]; then
+if [ -n "$INITRAMFS_PATH" ] && [ -f "$INITRAMFS_PATH" ]; then
     cp "$INITRAMFS_PATH" "$VISO_BUILD/boot/"
+    log_ok "Initramfs copied to VISO"
 fi
 
 # Copy rootfs
@@ -217,7 +261,7 @@ EOF
 log_ok "VISO structure created"
 
 # ============================================================================
-# Step 4: Create VISO image (qcow2)
+# Step 5: Create VISO image (qcow2)
 # ============================================================================
 log_step "Creating VISO image..."
 
@@ -244,23 +288,39 @@ mkdir -p "$VISO_MOUNT"
 # Use loop device
 LOOP_DEV=$(losetup -f --show "$VISO_RAW" 2>/dev/null) || {
     log_warn "Cannot create loop device (requires root)"
-    log_info "Creating VISO as directory archive instead"
+    log_info "Creating bootable VISO using alternative method..."
     
-    # Fallback: create tar archive
-    tar -czf "$OUTPUT_DIR/${VISO_NAME}.viso.tar.gz" -C "$VISO_BUILD" .
-    log_ok "VISO archive created: ${VISO_NAME}.viso.tar.gz"
-    
-    # Also create qcow2 if qemu-img is available
-    if command -v qemu-img >/dev/null 2>&1; then
-        qemu-img create -f qcow2 "$VISO_IMG" "${VISO_REQUIRED_SIZE}M"
-        log_ok "Empty VISO qcow2 created (populate manually)"
+    # Alternative: Use qemu-nbd for mounting if available
+    if command -v qemu-nbd >/dev/null 2>&1; then
+        log_info "Attempting qemu-nbd mount..."
+        qemu-nbd -c /dev/nbd0 "$VISO_RAW" 2>/dev/null && sleep 1
+        if [ -e /dev/nbd0p1 ]; then
+            mount /dev/nbd0p1 "$VISO_MOUNT" 2>/dev/null || {
+                log_warn "qemu-nbd mount failed"
+                LOOP_DEV=""
+            }
+        else
+            LOOP_DEV=""
+        fi
     fi
     
-    # Skip to summary
-    VISO_CREATED="archive"
+    # If qemu-nbd also failed, fallback to filesystem copy approach
+    if [ -z "$LOOP_DEV" ] && [ ! -d "$VISO_MOUNT/boot" ]; then
+        log_info "Using filesystem copy approach..."
+        mount "$VISO_RAW" "$VISO_MOUNT" 2>/dev/null || {
+            # Last resort: create compressed archive
+            log_warn "All mounting methods failed"
+            log_info "Creating VISO as compressed archive"
+            tar -czf "$OUTPUT_DIR/${VISO_NAME}.viso.tar.gz" -C "$VISO_BUILD" .
+            log_ok "VISO archive created: ${VISO_NAME}.viso.tar.gz"
+            rm -f "$VISO_RAW"
+            VISO_CREATED="archive"
+        }
+    fi
 }
 
-if [ -n "$LOOP_DEV" ]; then
+if [ -n "$LOOP_DEV" ] && [ -d "$VISO_MOUNT/boot" ]; then
+    # Mount succeeded
     mount "$LOOP_DEV" "$VISO_MOUNT"
     
     # Copy VISO content
@@ -282,10 +342,69 @@ if [ -n "$LOOP_DEV" ]; then
         log_ok "VISO raw image created"
         VISO_CREATED="raw"
     fi
+elif [ -d "$VISO_MOUNT/boot" ]; then
+    # Mount succeeded without loop device
+    cp -a "$VISO_BUILD"/* "$VISO_MOUNT/"
+    sync
+    umount "$VISO_MOUNT"
+    
+    # Convert to qcow2
+    if command -v qemu-img >/dev/null 2>&1; then
+        qemu-img convert -f raw -O qcow2 -c "$VISO_RAW" "$VISO_IMG"
+        rm -f "$VISO_RAW"
+        log_ok "VISO qcow2 created"
+        VISO_CREATED="qcow2"
+    else
+        mv "$VISO_RAW" "$VISO_IMG.raw"
+        log_ok "VISO raw image created"
+        VISO_CREATED="raw"
+    fi
+elif [ "$VISO_CREATED" != "archive" ]; then
+    # If we still have the raw image but couldn't mount, use directory copy
+    log_info "Creating bootable QCOW2 from directory..."
+    if command -v qemu-img >/dev/null 2>&1; then
+        # Create empty QCOW2 and document structure
+        qemu-img create -f qcow2 "$VISO_IMG" "${VISO_REQUIRED_SIZE}M" 2>/dev/null
+        log_warn "VISO qcow2 created but requires manual filesystem setup"
+        log_info "VISO structure available at: $VISO_BUILD"
+        VISO_CREATED="qcow2-empty"
+    fi
+    rm -f "$VISO_RAW"
 fi
 
 # ============================================================================
-# Step 5: Create additional formats
+# Step 6: Setup bootloader for VISO (if needed)
+# ============================================================================
+log_step "Setting up bootloader..."
+
+# Install GRUB bootloader to VISO if available
+if [ "$VISO_CREATED" = "qcow2" ] || [ "$VISO_CREATED" = "raw" ]; then
+    if command -v grub-install >/dev/null 2>&1 && [ -d "$VISO_MOUNT" ]; then
+        log_info "Installing GRUB bootloader..."
+        
+        # Create grub config
+        GRUB_CFG="$VISO_MOUNT/boot/grub/grub.cfg"
+        mkdir -p "$(dirname "$GRUB_CFG")"
+        
+        cat > "$GRUB_CFG" << 'GRUB_EOF'
+menuentry 'MixOS-GO' {
+    linux /boot/vmlinuz-mixos root=/dev/vda1 ro quiet
+    initrd /boot/initramfs-mixos.img
+}
+GRUB_EOF
+        
+        log_ok "GRUB configuration created"
+    fi
+fi
+
+# Document bootable VISO status
+if [ "$VISO_CREATED" = "archive" ]; then
+    log_warn "VISO created as archive (non-bootable)"
+    log_info "To create bootable VISO, try running with sudo or use Docker"
+fi
+
+# ============================================================================
+# Step 7: Create additional formats
 # ============================================================================
 log_step "Creating additional formats..."
 
@@ -357,7 +476,7 @@ rm -rf "$VRAM_PKG"
 log_ok "VRAM package created"
 
 # ============================================================================
-# Step 6: Generate checksums
+# Step 8: Generate checksums
 # ============================================================================
 log_step "Generating checksums..."
 
