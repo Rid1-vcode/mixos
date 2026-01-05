@@ -10,7 +10,7 @@ SHELL := /bin/bash
 VERSION := 1.0.0
 BUILD_DIR := $(CURDIR)/.tmp/mixos-build
 OUTPUT_DIR := $(CURDIR)/artifacts
-KERNEL_VERSION := 6.6.8-mixos
+KERNEL_VERSION := 6.6.8
 JOBS := $(shell nproc)
 
 # VISO/VRAM Configuration
