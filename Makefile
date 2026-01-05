@@ -173,7 +173,7 @@ rootfs: kernel installer mix-cli packages
 # ISO Image (Traditional)
 #=============================================================================
 
-iso: rootfs initramfs
+iso: kernel rootfs initramfs
 	@echo -e "$(YELLOW)Building ISO image...$(NC)"
 	@bash build/scripts/build-iso.sh
 	@echo -e "$(GREEN)✓ ISO generated$(NC)"
@@ -193,14 +193,15 @@ iso-autoinstall: toolchain-check
 # VISO/SDISK/VRAM (Revolutionary Features)
 #=============================================================================
 
-# initramfs depends on kernel (for modules) - rootfs is optional but recommended
-initramfs: kernel
+# initramfs depends on kernel (for modules) AND rootfs (for module installation)
+# This ensures modules are properly installed before initramfs is built
+initramfs: kernel rootfs modules-dep
 	@echo -e "$(CYAN)Building enhanced initramfs with VISO/VRAM support...$(NC)"
 	@mkdir -p $(OUTPUT_DIR)/boot
 	@bash build/scripts/build-initramfs.sh
 	@echo -e "$(GREEN)✓ Initramfs built$(NC)"
 
-viso: rootfs initramfs
+viso: kernel rootfs initramfs
 	@echo -e "$(CYAN)Building VISO (Virtual ISO) image...$(NC)"
 	@bash build/scripts/build-viso.sh
 	@echo -e "$(GREEN)✓ VISO generated: $(VISO_NAME).viso$(NC)"
@@ -223,7 +224,7 @@ vram: rootfs
 		echo -e "$(GREEN)✓ VRAM package created$(NC)"; \
 	fi
 
-modules-dep:
+modules-dep: rootfs
 	@echo -e "$(YELLOW)Generating kernel module dependencies...$(NC)"
 	@bash build/scripts/gen-modules-dep.sh
 	@echo -e "$(GREEN)✓ Module dependencies generated$(NC)"
