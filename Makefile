@@ -35,7 +35,7 @@ NC := \033[0m
 #=============================================================================
 
 # all: toolchain-check kernel mix-cli installer packages rootfs iso
-all: toolchain-check kernel mix-cli installer packages rootfs initramfs viso iso
+all: toolchain-check kernel mix-cli installer packages rootfs initramfs iso viso
 	@echo -e "$(GREEN)✓ MixOS-GO v$(VERSION) build complete!$(NC)"
 	@echo ""
 	@echo "Build artifacts:"
